@@ -66,6 +66,8 @@ void zlibc_free(void *ptr) {
 #define calloc(count,size) je_calloc(count,size)
 #define realloc(ptr,size) je_realloc(ptr,size)
 #define free(ptr) je_free(ptr)
+#define mallocx(size,flags) je_mallocx(size,flags)
+#define dallocx(ptr,flags) je_dallocx(ptr,flags)
 #endif
 
 #define update_zmalloc_stat_alloc(__n) do { \
@@ -114,6 +116,24 @@ void *zmalloc(size_t size) {
     return (char*)ptr+PREFIX_SIZE;
 #endif
 }
+
+/* Allocation and free functions that bypass the thread cache
+ * and go straight to the allocator arena bins.
+ * Currently implemented only for jemalloc. Used for online defragmentation. */
+#ifdef HAVE_DEFRAG
+void *zmalloc_no_tcache(size_t size) {
+    void *ptr = mallocx(size+PREFIX_SIZE, MALLOCX_TCACHE_NONE);
+    if (!ptr) zmalloc_oom_handler(size);
+    update_zmalloc_stat_alloc(zmalloc_size(ptr));
+    return ptr;
+}
+
+void zfree_no_tcache(void *ptr) {
+    if (ptr == NULL) return;
+    update_zmalloc_stat_free(zmalloc_size(ptr));
+    dallocx(ptr, MALLOCX_TCACHE_NONE);
+}
+#endif
 
 void *zcalloc(size_t size) {
     void *ptr = calloc(1, size+PREFIX_SIZE);
@@ -304,14 +324,26 @@ float zmalloc_get_fragmentation_ratio(size_t rss) {
  * /proc/self/smaps. The field must be specified with trailing ":" as it
  * apperas in the smaps output.
  *
- * Example: zmalloc_get_smap_bytes_by_field("Rss:");
+ * If a pid is specified, the information is extracted for such a pid,
+ * otherwise if pid is -1 the information is reported is about the
+ * current process.
+ *
+ * Example: zmalloc_get_smap_bytes_by_field("Rss:",-1);
  */
 #if defined(HAVE_PROC_SMAPS)
-size_t zmalloc_get_smap_bytes_by_field(char *field) {
+size_t zmalloc_get_smap_bytes_by_field(char *field, long pid) {
     char line[1024];
     size_t bytes = 0;
-    FILE *fp = fopen("/proc/self/smaps","r");
     int flen = strlen(field);
+    FILE *fp;
+
+    if (pid == -1) {
+        fp = fopen("/proc/self/smaps","r");
+    } else {
+        char filename[128];
+        snprintf(filename,sizeof(filename),"/proc/%ld/smaps",pid);
+        fp = fopen(filename,"r");
+    }
 
     if (!fp) return 0;
     while(fgets(line,sizeof(line),fp) != NULL) {
@@ -327,14 +359,15 @@ size_t zmalloc_get_smap_bytes_by_field(char *field) {
     return bytes;
 }
 #else
-size_t zmalloc_get_smap_bytes_by_field(char *field) {
+size_t zmalloc_get_smap_bytes_by_field(char *field, long pid) {
     ((void) field);
+    ((void) pid);
     return 0;
 }
 #endif
 
-size_t zmalloc_get_private_dirty(void) {
-    return zmalloc_get_smap_bytes_by_field("Private_Dirty:");
+size_t zmalloc_get_private_dirty(long pid) {
+    return zmalloc_get_smap_bytes_by_field("Private_Dirty:",pid);
 }
 
 /* Returns the size of physical memory (RAM) in bytes.
